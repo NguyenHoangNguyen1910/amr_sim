@@ -25,7 +25,27 @@ Open <http://localhost:8010>.
 
 ## Reeman robot18 với ROS Noetic gốc
 
-### Docker Compose (port 8020)
+### Run port 8020 from Docker Hub
+
+Clone this repository and use Docker Compose with an x86-64 Linux Docker
+engine. On Windows, use Docker Desktop in Linux containers mode. Run this
+from the root of the checkout:
+
+```bash
+docker compose -f docker-compose.reeman.yml up --wait
+```
+
+Open <http://localhost:8020>. Compose pulls the Noetic runtime and Gazebo
+images from `nguyenhoangnguyen/reeman_code`. If the registry requires
+authentication, run `docker login` with an account that has pull access.
+The simulator loads its launcher, bridge, and web UI from the Git checkout.
+The simulated room uses its own Docker volumes for maps and routes.
+
+```bash
+docker compose -f docker-compose.reeman.yml down
+```
+
+### Docker Compose with a local backup
 
 On Windows, enable Docker Desktop integration with Ubuntu WSL and run from the
 repository directory in Ubuntu:

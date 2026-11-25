@@ -1,0 +1,8 @@
+FROM ubuntu:20.04
+
+ADD runtime.tar /
+COPY noetic.sh /entrypoint.sh
+COPY gazebo_depth.cpp /gazebo_depth.cpp
+RUN /bin/bash /entrypoint.sh --build-openni /opt/reeman-portable/openni
+
+ENTRYPOINT ["/bin/bash", "/entrypoint.sh"]

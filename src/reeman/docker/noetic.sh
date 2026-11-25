@@ -1,6 +1,21 @@
 #!/bin/bash
 set -euo pipefail
 
+install=/home/reeman/reeman_ws/install
+build_openni() {
+    local output="$1"
+    mkdir -p -- "$output/OpenNI2/Drivers"
+    cp -L -- "$install/lib/libOpenNI2.so" "$output/"
+    /usr/bin/g++ -std=c++17 -O2 -shared -fPIC -pthread \
+        -I"$install/include/astra_camera/include/openni2" \
+        /gazebo_depth.cpp -o "$output/OpenNI2/Drivers/libGazeboDepth.so"
+}
+
+if [[ "${1:-}" == --build-openni ]]; then
+    build_openni "$2"
+    exit
+fi
+
 ready=/run/reeman-noetic-ready
 rm -f -- "$ready"
 previous="$(readlink /reeman-run/current || true)"
@@ -19,18 +34,29 @@ cleanup() {
 trap cleanup EXIT
 trap 'exit 130' INT TERM
 
-install=/home/reeman/reeman_ws/install
 for setup in /opt/ros/noetic/setup.bash /home/reeman/catkin_ws/install_isolated/setup.bash "$install/setup.bash"; do
     if [[ ! -r "$setup" ]]; then
         printf 'Missing Reeman runtime file %s\n' "$setup" >&2
         exit 1
     fi
 done
-mkdir -p -- "$session/openni/OpenNI2/Drivers"
-cp -L -- "$install/lib/libOpenNI2.so" "$session/openni/"
-/usr/bin/g++ -std=c++17 -O2 -shared -fPIC -pthread \
-    -I"$install/include/astra_camera/include/openni2" \
-    /gazebo_depth.cpp -o "$session/openni/OpenNI2/Drivers/libGazeboDepth.so"
+if [[ -d /opt/reeman-portable/openni ]]; then
+    cp -a -- /opt/reeman-portable/openni "$session/openni"
+    mkdir -- "$session/backup"
+    (
+        cd /
+        cp -aL --parents -- \
+            opt/ros/noetic/setup.bash \
+            "${install#/}/share/yoyo_bringup/launch" \
+            "${install#/}/share/yoyo_robot_api/launch" \
+            "${install#/}/share/astra_camera/launch" \
+            home/reeman/catkin_ws/install_isolated/share/cartographer_ros/launch/robot_2d.launch \
+            home/reeman/catkin_ws/install_isolated/share/cartographer_ros/configuration_files \
+            "$session/backup"
+    )
+else
+    build_openni "$session/openni"
+fi
 
 ln -sfnT -- "$session" /reeman-run/current
 touch -- "$ready"
@@ -47,12 +73,14 @@ ln -sfnT -- "$session/runtime" /sim
 ln -sfnT -- "$session/state" /sim-state
 ln -sfnT -- "$session/routes" /sim-routes
 mkdir -p -- /data
-for entry in /backup-data/*; do
-    name="${entry##*/}"
-    if [[ "$name" != maps ]]; then
-        ln -sfnT -- "$entry" "/data/$name"
-    fi
-done
+if [[ -d /backup-data ]]; then
+    for entry in /backup-data/*; do
+        name="${entry##*/}"
+        if [[ "$name" != maps ]]; then
+            ln -sfnT -- "$entry" "/data/$name"
+        fi
+    done
+fi
 ln -sfnT -- /sim-state/maps /data/maps
 ln -sfnT -- /data /home/reeman/data
 

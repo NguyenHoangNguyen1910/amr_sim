@@ -1,0 +1,45 @@
+name: reeman-8020
+
+services:
+  reeman-noetic:
+    image: nguyenhoangnguyen/reeman_code:noetic-8020
+    platform: linux/amd64
+    environment:
+      REEMAN_WORLD: room
+    healthcheck:
+      test: ["CMD", "/usr/bin/test", "-f", "/run/reeman-noetic-ready"]
+      interval: 2s
+      timeout: 3s
+      retries: 40
+    volumes:
+      - reeman-run:/reeman-run
+      - reeman-data:/reeman-data
+  reeman-gazebo:
+    image: nguyenhoangnguyen/reeman_code:gazebo-8020
+    platform: linux/amd64
+    init: true
+    depends_on:
+      reeman-noetic:
+        condition: service_healthy
+        restart: true
+    entrypoint: ["/bin/bash", "src/reeman/docker/gazebo.sh"]
+    environment:
+      REEMAN_WORLD: room
+      XDG_DATA_HOME: /reeman-data
+      LIBGL_ALWAYS_SOFTWARE: "1"
+    ports:
+      - "127.0.0.1:8020:8020"
+      - "127.0.0.1:9012:9012"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8020/api/version"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+    volumes:
+      - ./src/reeman:/app/src/reeman:ro
+      - ./src/sim/visualize:/app/src/sim/visualize:ro
+      - reeman-run:/reeman-run
+      - reeman-data:/reeman-data
+volumes:
+  reeman-run:
+  reeman-data:
