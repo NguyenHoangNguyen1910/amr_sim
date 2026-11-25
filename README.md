@@ -25,8 +25,41 @@ Open <http://localhost:8010>.
 
 ## Reeman robot18 với ROS Noetic gốc
 
-The Reeman mode uses the existing Reeman WSL harness. It launches the deployed
-Noetic nodes from the read-only backup with a writable copy of the map data.
+### Docker Compose (port 8020)
+
+On Windows, enable Docker Desktop integration with Ubuntu WSL and run from the
+repository directory in Ubuntu:
+
+```bash
+docker compose --profile reeman up --build --wait reeman-gazebo
+```
+
+Open <http://localhost:8020>. The viewer connects to Gazebo on port 9012.
+This starts Gazebo Jetty and the original ROS Noetic stack in separate
+containers. The default world is the test room. Set `REEMAN_WORLD=map` before
+running the command to use the backed-up map.
+
+Set `REEMAN_BACKUP_DIR` to the Linux path of the extracted Reeman Ubuntu 20.04
+filesystem on your machine. On this workstation it defaults to
+`/mnt/d/Embedded_Backup/ubuntu_root_full`. If you have a prepared copy of
+`/opt/ros/noetic` and the two Reeman workspaces, point `REEMAN_RUNTIME_DIR` at
+that directory. The backup and runtime are mounted read-only. The
+`reeman-data` volume stores writable map and route data by world.
+
+```bash
+docker compose --profile reeman ps
+docker compose --profile reeman exec reeman-noetic tail -f /sim-state/ros.log
+docker compose --profile reeman stop reeman-gazebo reeman-noetic
+```
+
+Stop both Reeman services before rebuilding an active session so the Gazebo
+bridge and ROS master start together.
+
+### Ubuntu WSL launcher
+
+The Reeman mode uses the WSL harness in `src/reeman/harness`. It launches the
+deployed Noetic nodes from the read-only backup with a writable copy of the map
+data.
 The Gazebo world uses the map from the Reeman backup by default. Pass
 `--room` for the simple test room.
 The room uses its own static occupancy grid for navigation and starts a
@@ -55,10 +88,12 @@ grid frame at their acquisition time.
 Export saves the displayed grid as JSON. The active navigation map remains
 the one supplied by the original Reeman bringup.
 
-`REEMAN_HARNESS` selects the existing
-harness (default `/mnt/d/Gazebo/reeman-sim`). Its `REEMAN_BACKUP` and
-`REEMAN_RUNTIME` variables also apply. `REEMAN_HTTP_PORT` overrides 8010
-and `REEMAN_GZ_PORT` overrides 9002.
+`REEMAN_HARNESS` can override the bundled harness. Set `REEMAN_BACKUP` to the
+extracted Reeman filesystem (default `/mnt/d/Embedded_Backup/ubuntu_root_full`).
+`REEMAN_RUNTIME` can point to a prepared Linux copy of its Noetic and Reeman
+workspaces. The WSL launcher requires Bubblewrap (`bwrap`), Gazebo Jetty and
+its `gz.transport` and `gz.msgs` bindings for `/usr/bin/python3`.
+`REEMAN_HTTP_PORT` overrides 8010 and `REEMAN_GZ_PORT` overrides 9002.
 
 For a second session on port 8020, start the same launcher with
 `REEMAN_HTTP_PORT=8020 REEMAN_GZ_PORT=9012 bash src/reeman/run.sh --room`

@@ -18,6 +18,7 @@
   let maxSpan = 24;
   let robotPose;
   let navigation;
+  let sensorLayers = {};
   let generation = 0;
   let graph;
   let graphChecked = false;
@@ -32,6 +33,8 @@
   let obstacleActive = false;
   const obstacleButton = get("obstacle-demo-toggle");
   const placeObstacleButton = get("obstacle-place");
+  const obstacleA2Button = get("obstacle-a2");
+  const obstacleA2Height = get("obstacle-a2-height");
   const obstaclePick = get("obstacle-pick");
   const obstacleStatus = get("obstacle-placement-status");
   let placedObstacles = [];
@@ -193,6 +196,10 @@
     for (const obstacle of layout?.obstacles ?? []) {
       dot(obstacle, obstacle.radius * scale(), "#8997a7");
     }
+    const mapScale = scale();
+    mapSensorLayers.draw(context, sensorLayers,
+      x => canvas.width / 2 + (x - view.x) * mapScale,
+      y => canvas.height / 2 - (y - view.y) * mapScale);
     drawPlacedObstacles();
     for (const wall of walls) line(wall, "#fa756f", 4);
     if (wallStart) dot(wallStart, 5, "#fa756f");
@@ -206,7 +213,8 @@
       const { x, y } = pixel(point);
       context.fillStyle = "#fff";
       context.font = "13px sans-serif";
-      context.fillText(String(i + 1), x + 9, y - 7);
+      const a2Goal = placedObstacles.some(({goal}) => goal?.x === point.x && goal.y === point.y);
+      context.fillText(a2Goal ? "B" : String(i + 1), x + 9, y - 7);
     });
     const pose = robotPose;
     if (pose?.position) {
@@ -219,15 +227,19 @@
     }
   }
 
+  const a2HeightCm = obstacle => Math.round(obstacle.height * 100);
+  const a2Label = obstacle => `A2 · ${a2HeightCm(obstacle)} cm`;
+
   function drawPlacedObstacles() {
-    for (const {id, x, y, yaw, length, width} of placedObstacles) {
+    for (const obstacle of placedObstacles) {
+      const {id, x, y, yaw, length, width, kind, goal} = obstacle;
       const center = pixel({x, y});
       const halfLength = length * scale() / 2;
       const halfWidth = width * scale() / 2;
       context.save();
       context.translate(center.x, center.y);
       context.rotate(-yaw);
-      context.fillStyle = "#ce712e";
+      context.fillStyle = kind === "a2" ? "#cc5374" : "#ce712e";
       context.strokeStyle = "#623210";
       context.lineWidth = id === Number(obstaclePick.value) ? 3 : 1.5;
       context.fillRect(-halfLength, -halfWidth, 2 * halfLength, 2 * halfWidth);
@@ -235,7 +247,13 @@
       context.restore();
       context.fillStyle = "#4a260d";
       context.font = "bold 13px sans-serif";
-      context.fillText(`#${id}`, center.x + 7, center.y - 9);
+      context.fillText(kind === "a2" ? a2Label(obstacle) : `#${id}`, center.x + 7, center.y - 9);
+      if (goal && !waypoints.some(point => point.x === goal.x && point.y === goal.y)) {
+        dot(goal, 4, "#2076ac");
+        const target = pixel(goal);
+        context.fillStyle = "#1c557d";
+        context.fillText("B", target.x + 7, target.y - 6);
+      }
     }
   }
 
@@ -243,6 +261,11 @@
     const busy = ["PLANNING", "NAVIGATING", "RESETTING"].includes(navigation?.state);
     const graphMode = mode.startsWith("graph-");
     placeObstacleButton.disabled = !layout || obstacleBusy || placedObstacles.length >= obstacleLimit;
+    const a2 = placedObstacles.find(({kind}) => kind === "a2");
+    obstacleA2Button.textContent = a2 ? "Đổi chiều cao A2" : "Đặt vật A2";
+    obstacleA2Height.disabled = obstacleBusy || busy;
+    obstacleA2Button.disabled = obstacleA2Height.disabled || !robotPose || !layout
+      || (a2 ? a2HeightCm(a2) === Number(obstacleA2Height.value) : placeObstacleButton.disabled);
     placeObstacleButton.setAttribute("aria-pressed", String(placingObstacle));
     placeObstacleButton.textContent = placingObstacle ? "Hủy đặt vật cản" : "Đặt vật cản";
     get("obstacle-remove").disabled = obstacleBusy || !obstaclePick.value;
@@ -252,8 +275,11 @@
     const canPlan = graphMode ? graphGoal.value && !graphDirty : mode === "route" && waypoints.length;
     get("map-plan-route").disabled = !layout || !canPlan || busy;
     const graphPlan = navigation?.goal?.kind === "defined-route";
+    const goal = navigation?.goal;
+    const matchingFreeGoal = !nativeMap || (waypoints[0]?.x === goal?.x && waypoints[0]?.y === goal?.y);
     const matchingPlan = graphMode
-      ? graphPlan && !graphDirty && graphGoal.value === navigation.goal.name : mode === "route" && !graphPlan;
+      ? graphPlan && !graphDirty && graphGoal.value === goal.name
+      : mode === "route" && !graphPlan && matchingFreeGoal;
     get("map-start-route").disabled = navigation?.state !== "READY" || !matchingPlan;
     get("map-save-walls").disabled = !layout || busy || navigation?.state === "READY";
     get("map-route-mode").classList.toggle("active", mode === "route");
@@ -331,18 +357,23 @@
 
   function showPlacedObstacles(obstacles, selectedId = obstaclePick.value) {
     placedObstacles = obstacles;
-    obstaclePick.replaceChildren(...obstacles.map(({id}) => new Option(`Vật cản #${id}`, id)));
+    obstaclePick.replaceChildren(...obstacles.map(obstacle =>
+      new Option(obstacle.kind === "a2" ? a2Label(obstacle) : `Vật cản #${obstacle.id}`, obstacle.id)));
     if (obstacles.some(({id}) => id === Number(selectedId))) obstaclePick.value = selectedId;
     get("placed-obstacle-tools").hidden = !obstacles.length;
     refreshControls();
     draw();
   }
 
+  mapSensorLayers.controls.addEventListener("change", draw);
+
   async function loadPlacedObstacles(session) {
     try {
       const result = await api("/api/obstacles/barriers");
       if (session !== generation) return;
       obstacleLimit = result.limit;
+      const a2 = result.obstacles.find(({kind}) => kind === "a2");
+      if (a2) obstacleA2Height.value = String(a2HeightCm(a2));
       showPlacedObstacles(result.obstacles);
     } catch (error) {
       if (session === generation) obstacleStatus.textContent = error.message;
@@ -352,9 +383,12 @@
   async function poll(session) {
     if (drawer.hidden || session !== generation) return;
     try {
+      const query = get("static-map-tools").hidden ? "" : mapSensorLayers.query();
       const {pose, navigation: status, dock, relocate_available: relocateAvailable,
-        camera_obstacle_demo: cameraDemo, obstacle_wait: obstacleWait} = await api("/api/map/live");
+        camera_obstacle_demo: cameraDemo, obstacle_wait: obstacleWait,
+        sensor_layers: layers} = await api("/api/map/live" + (query ? "?" + query : ""));
       if (drawer.hidden || session !== generation) return;
+      sensorLayers = layers ?? {};
       robotPose = pose;
       navigation = status;
       docking = dock;
@@ -524,11 +558,41 @@
     placingObstacle = !placingObstacle;
     obstacleStatus.textContent = placingObstacle ? "Bấm vào vị trí đặt rào cam trên bản đồ." : "";
   });
+  obstacleA2Height.addEventListener("change", refreshControls);
+  action("obstacle-a2", async () => {
+    const existing = placedObstacles.some(({kind}) => kind === "a2");
+    const heightCm = Number(obstacleA2Height.value);
+    obstacleBusy = true;
+    refreshControls();
+    try {
+      const result = await api("/api/obstacles/barriers", "POST", {
+        action: existing ? "change_a2" : "add_a2", height_cm: heightCm,
+      });
+      const test = result.obstacles.find(({kind}) => kind === "a2");
+      placingObstacle = false;
+      if (!existing) {
+        mode = "route";
+        waypoints.splice(0, waypoints.length, test.goal);
+      }
+      showPlacedObstacles(result.obstacles, test.id);
+      obstacleStatus.textContent = existing
+        ? `Đã đổi chiều cao A2 thành ${heightCm} cm.`
+        : `Đã đặt vật A2 cao ${heightCm} cm. Bấm Lập tuyến rồi Chạy tuyến để robot đi tới B.`;
+    } catch (error) {
+      obstacleStatus.textContent = error.message;
+    } finally {
+      obstacleBusy = false;
+    }
+  });
   action("obstacle-remove", async () => {
     obstacleBusy = true;
     refreshControls();
     try {
       const result = await api("/api/obstacles/barriers", "POST", {action: "remove", id: Number(obstaclePick.value)});
+      const removed = placedObstacles.find(({id}) => id === result.removed);
+      if (removed?.goal && waypoints[0]?.x === removed.goal.x && waypoints[0]?.y === removed.goal.y) {
+        waypoints.length = 0;
+      }
       showPlacedObstacles(placedObstacles.filter(({id}) => id !== result.removed));
       obstacleStatus.textContent = `Đã gỡ vật cản #${result.removed}.`;
     } catch (error) {

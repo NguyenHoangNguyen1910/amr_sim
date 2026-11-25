@@ -8,7 +8,7 @@
     <script src="vendor/eventemitter2.min.js"></script>
     <script src="vendor/gz.js"></script>
     <script src="vendor/gz3d.js"></script>
-    <link rel="stylesheet" href="styles.css?v=15" />
+    <link rel="stylesheet" href="styles.css?v=16" />
   </head>
   <body>
     <header id="topbar">
@@ -112,9 +112,15 @@
         <button id="map-show-layout" type="button" aria-pressed="true">Bản đồ có sẵn</button>
         <button id="map-show-slam" type="button" aria-pressed="false">Tạo bản đồ mới</button>
       </div>
+      <fieldset id="map-sensor-layers" hidden>
+        <legend>Lớp cảm biến</legend>
+        <label title="LiDAR gốc /scan"><input type="checkbox" value="lidar" checked /> LiDAR</label>
+        <label title="Laser scan đã lọc /scan2"><input type="checkbox" value="laser" /> Laser scan lọc</label>
+        <label title="Điểm vật cản từ /camera/scan"><input type="checkbox" value="camera" /> Camera 3D</label>
+      </fieldset>
       <section id="mapping-tools" hidden aria-label="Lập bản đồ SLAM">
         <canvas id="slam-map" width="640" height="520" aria-label="Bản đồ lưới SLAM"></canvas>
-        <p class="slam-legend"><span class="slam-robot-key">● Robot và hướng</span><span class="slam-scan-key">━ Tia LiDAR</span></p>
+        <p class="slam-legend"><span class="slam-robot-key">● Robot và hướng</span><span id="slam-scan-key" class="slam-scan-key">━ Tia LiDAR</span></p>
         <div class="map-actions">
           <button id="slam-start" type="button">Bắt đầu bản đồ trắng</button>
           <button id="slam-stop" type="button" disabled>Dừng quét</button>
@@ -178,6 +184,21 @@
           </select>
           <button id="obstacle-demo-toggle" type="button" aria-pressed="false">Thử vật cản động</button>
         </div>
+        <div class="map-actions">
+          <label for="obstacle-a2-height">Chiều cao vật A2</label>
+          <select id="obstacle-a2-height">
+            <option value="15">15 cm</option>
+            <option value="14">14 cm</option>
+            <option value="13">13 cm</option>
+            <option value="12">12 cm</option>
+            <option value="11">11 cm</option>
+            <option value="10">10 cm</option>
+            <option value="9">9 cm</option>
+            <option value="8">8 cm</option>
+            <option value="7">7 cm</option>
+          </select>
+          <button id="obstacle-a2" type="button" disabled>Đặt vật A2</button>
+        </div>
         <div id="placed-obstacle-tools" class="map-actions" hidden>
           <select id="obstacle-pick" aria-label="Vật cản đã đặt"></select>
           <button id="obstacle-remove" type="button">Gỡ vật cản</button>
@@ -213,7 +234,8 @@
     </aside>
     </div>
     <script src="app.js?v=15"></script>
-    <script src="map-tools.js?v=11"></script>
-    <script src="slam-map.js?v=5"></script>
+    <script src="sensor-layers.js?v=1"></script>
+    <script src="map-tools.js?v=14"></script>
+    <script src="slam-map.js?v=6"></script>
   </body>
 </html>

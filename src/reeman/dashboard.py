@@ -14,6 +14,7 @@ import tempfile
 import threading
 import time
 from http.server import BaseHTTPRequestHandler
+from urllib.parse import parse_qs, urlsplit
 
 import actionlib
 import rospy
@@ -30,8 +31,13 @@ from tf2_msgs.msg import TFMessage
 
 from defined_routes import DefinedRoutes, RouteModel
 from docking import Docking
+from dynamic_obstacle import A2_DISTANCE, A2_GOAL_OFFSET, A2_HEIGHTS
 from obstacle_wait import ObstacleWait
 from relocation import ROOM_CONFIG, Relocation
+
+
+SENSOR_LAYERS = ("lidar", "laser", "camera")
+VIEWER_ROOT = Path(__file__).resolve().with_name("viewer")
 
 
 class Robot:
@@ -50,7 +56,7 @@ class Robot:
         self.routes = DefinedRoutes(RouteModel(route_store / "model.xml")) if route_store.is_dir() else None
         self.obstacle_wait = ObstacleWait(route_store / "stop_move_time.txt") if self.routes else None
         self.scan = None
-        self.recent_scans = deque(maxlen=12)
+        self.recent_scans = {layer: deque(maxlen=12) for layer in SENSOR_LAYERS}
         self.imu = None
         self.camera_scan = None
         self.depth_message = None
@@ -160,14 +166,18 @@ class Robot:
         self.record("LiDAR /scan", msg, "{} tia".format(len(msg.ranges)))
         with self.lock:
             self.scan = msg
-            self.recent_scans.append(msg)
+            self.recent_scans["lidar"].append(msg)
 
     def on_filtered(self, msg):
-        self.record("LiDAR /scan2", msg, "{} tia".format(len(msg.ranges)))
+        with self.lock:
+            self.recent_scans["laser"].append(msg)
+            self.samples["LiDAR /scan2"] = {"seconds": msg.header.stamp.to_sec(),
+                                          "value": "{} tia".format(len(msg.ranges))}
 
     def on_camera_scan(self, msg):
         with self.lock:
             self.camera_scan = msg
+            self.recent_scans["camera"].append(msg)
             self.samples["Camera /camera/scan"] = {"seconds": msg.header.stamp.to_sec(),
                                                   "value": "{} tia".format(len(msg.ranges))}
 
@@ -317,15 +327,22 @@ class Robot:
             self.sent = True
 
     def free_map_point(self, x, y):
+        return self.free_map_points(((x, y),))
+
+    def free_map_points(self, points):
         with self.lock:
             image = self.map
         if image is None:
             return False
         info, cells = image
-        col, row = (math.floor((v - origin) / info["resolution"])
-                    for v, origin in zip((x, y), info["origin"]))
-        return (0 <= col < info["width"] and 0 <= row < info["height"]
-                and 0 < cells[row * info["width"] + col] < 66)
+        ox, oy = info["origin"]
+        step = info["resolution"]
+        width, height = info["width"], info["height"]
+        for x, y in points:
+            col, row = math.floor((x - ox) / step), math.floor((y - oy) / step)
+            if not (0 <= col < width and 0 <= row < height and 0 < cells[row * width + col] < 66):
+                return False
+        return True
 
     def gazebo_barriers(self, command, **data):
         with self.command_lock:
@@ -333,8 +350,20 @@ class Robot:
                 return obstacle_request(command, **data)
             if command == "add" and not self.free_map_point(*data["pose"][:2]):
                 raise ValueError("Chọn vùng trống trên bản đồ để đặt vật cản")
+            if command in ("add_a2", "change_a2"):
+                self.check_route_idle()
             pose = self.relocation.pose_in("map")
-            return obstacle_request(command, robot=(pose["x"], pose["y"], pose["yaw"]), **data)
+            x, y, yaw = pose["x"], pose["y"], pose["yaw"]
+            if command == "add_a2":
+                c, s = math.cos(yaw), math.sin(yaw)
+                end = A2_DISTANCE + A2_GOAL_OFFSET + .35
+                points = ((x + c * distance - s * lateral, y + s * distance + c * lateral)
+                          for distance in (i * .05 for i in range(7, round(end / .05) + 1))
+                          for lateral in (-.27, 0, .27))
+                if not self.free_map_points(points):
+                    raise ValueError("A2 cần khoảng trống trước xe. Từ vị trí xuất phát, quay về phía dưới bản đồ rồi thử lại.")
+                data["pose"] = (x + A2_DISTANCE * c, y + A2_DISTANCE * s, yaw + math.pi / 2)
+            return obstacle_request(command, robot=(x, y, yaw), **data)
 
     def save_dock(self, pose):
         with self.command_lock:
@@ -544,7 +573,35 @@ class Robot:
         return {"x": translation.x, "y": translation.y,
                 "yaw": math.atan2(2 * (q.w*q.z + q.x*q.y), 1 - 2 * (q.y*q.y + q.z*q.z))}
 
-    def update_mapping_overlay(self):
+    def project_scan(self, buffer, frame, source, previous=None, oldest_stamp=0):
+        with self.lock:
+            recent = tuple(self.recent_scans[source])
+        for sample in reversed(recent):
+            stamp = sample.header.stamp.to_nsec()
+            if stamp < oldest_stamp or (previous and stamp <= previous["stamp"]):
+                break
+            try:
+                sensor = self.transform_pose(buffer.lookup_transform(
+                    frame, sample.header.frame_id.lstrip("/"), sample.header.stamp,
+                ).transform)
+            except tf2_ros.TransformException:
+                continue
+            return {
+                **sensor, "stamp": stamp, "angle_min": sample.angle_min,
+                "angle_step": sample.angle_increment,
+                "ranges": [value if math.isfinite(value) and sample.range_min <= value <= sample.range_max
+                           else None for value in sample.ranges],
+            }
+        return previous
+
+    def sensor_layers(self, buffer, frame, sources):
+        if not sources or buffer is None or not frame:
+            return {}
+        oldest_stamp = rospy.Time.now().to_nsec() - 2_000_000_000
+        return {source: self.project_scan(buffer, frame, source, oldest_stamp=oldest_stamp)
+                for source in sources}
+
+    def update_mapping_overlay(self, include_scan=True):
         with self.mapping_lock:
             buffer, frame = self.mapping_tf, self.mapping_frame
             previous = self.mapping_overlay
@@ -555,38 +612,32 @@ class Robot:
         except tf2_ros.TransformException:
             return
 
-        with self.lock:
-            recent = tuple(self.recent_scans)
         scan = previous["scan"] if previous else None
-        for sample in reversed(recent):
-            stamp = sample.header.stamp.to_nsec()
-            if scan and stamp <= scan["stamp"]:
-                break
-            try:
-                laser = self.transform_pose(buffer.lookup_transform(
-                    frame, sample.header.frame_id.lstrip("/"), sample.header.stamp,
-                ).transform)
-            except tf2_ros.TransformException:
-                continue
-            scan = {
-                **laser, "stamp": stamp, "angle_min": sample.angle_min,
-                "angle_step": sample.angle_increment,
-                "ranges": [value if math.isfinite(value) and sample.range_min <= value <= sample.range_max
-                           else None for value in sample.ranges],
-            }
-            break
+        if include_scan:
+            scan = self.project_scan(buffer, frame, "lidar", previous=scan)
         with self.mapping_lock:
             if buffer is self.mapping_tf:
+                latest = self.mapping_overlay["scan"] if self.mapping_overlay else None
+                if latest and (scan is None or latest["stamp"] > scan["stamp"]):
+                    scan = latest
                 self.mapping_overlay = {"pose": pose, "scan": scan}
 
-    def mapping_status(self, after=-1, previous=""):
-        self.update_mapping_overlay()
+    def mapping_status(self, after=-1, previous="", layers=None):
+        self.update_mapping_overlay(include_scan=layers is None or "lidar" in layers)
         with self.mapping_lock:
             online = all(p.poll() is None for p in self.mapping_processes)
-            return {"active": bool(self.mapping_processes), "online": online,
-                    "session": self.mapping_session, "revision": self.mapping_revision,
-                    "overlay": self.mapping_overlay,
-                    "grid": self.mapping_grid if after != self.mapping_revision or previous != self.mapping_session else None}
+            buffer, frame, overlay = self.mapping_tf, self.mapping_frame, self.mapping_overlay
+            status = {"active": bool(self.mapping_processes), "online": online,
+                      "session": self.mapping_session, "revision": self.mapping_revision,
+                      "overlay": overlay,
+                      "grid": self.mapping_grid if after != self.mapping_revision
+                      or previous != self.mapping_session else None}
+        if layers is not None:
+            status["overlay"] = {"pose": overlay["pose"]} if overlay else None
+            status["sensor_layers"] = self.sensor_layers(buffer, frame, [s for s in layers if s != "lidar"])
+            if "lidar" in layers:
+                status["sensor_layers"]["lidar"] = overlay["scan"] if overlay else None
+        return status
 
     def drive(self, linear, angular):
         if self.room_mode and abs(angular) > 0.2:
@@ -619,6 +670,13 @@ class Dashboard(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def requested_sensor_layers(self):
+        query = parse_qs(urlsplit(self.path).query, keep_blank_values=True)
+        if "layers" not in query:
+            return None
+        selected = query["layers"][0].split(",")
+        return [name for name in SENSOR_LAYERS if name in selected]
+
     def do_GET(self):
         robot = self.server.robot
         path = self.path.split("?", 1)[0]
@@ -640,6 +698,9 @@ class Dashboard(BaseHTTPRequestHandler):
                     status["camera_obstacle_demo"] = True
                 if robot.obstacle_wait:
                     status["obstacle_wait"] = robot.obstacle_wait.status()
+                layers = self.requested_sensor_layers()
+                if layers is not None:
+                    status["sensor_layers"] = robot.sensor_layers(robot.buffer, "map", layers)
                 self.reply(200, status)
             else:
                 self.reply(200, {"sensors": {"model_pose": model_pose},
@@ -703,17 +764,16 @@ class Dashboard(BaseHTTPRequestHandler):
             except RuntimeError as error:
                 self.reply(503, {"error": str(error)})
         elif path == "/api/slam/map":
-            from urllib.parse import parse_qs, urlsplit
             query = parse_qs(urlsplit(self.path).query)
-            self.reply(200, robot.mapping_status(int(query.get("after", [-1])[0]), query.get("previous", [""])[0]))
+            self.reply(200, robot.mapping_status(int(query.get("after", [-1])[0]),
+                                                query.get("previous", [""])[0], self.requested_sensor_layers()))
         elif path == "/api/version":
             self.reply(200, {"backend": "reeman-noetic",
                              **({"directed_routes": True, "docking": True} if robot.routes else {}),
                              **({"relocate": True} if robot.relocation else {})})
         else:
-            root = Path(__file__).with_name("viewer")
-            asset = (root / (path.lstrip("/") or "index.html")).resolve()
-            if root not in asset.parents or not asset.is_file():
+            asset = (VIEWER_ROOT / (path.lstrip("/") or "index.html")).resolve()
+            if VIEWER_ROOT not in asset.parents or not asset.is_file():
                 self.reply(404, {"error": "Không tìm thấy"})
                 return
             mime = mimetypes.guess_type(str(asset))[0] or "application/octet-stream"
@@ -785,6 +845,8 @@ class Dashboard(BaseHTTPRequestHandler):
                 if request == "add":
                     pose = coordinates(data, ("x", "y", "yaw"), (1000, 1000, math.tau))
                     response = robot.gazebo_barriers("add", pose=pose)
+                elif request in ("add_a2", "change_a2"):
+                    response = robot.gazebo_barriers(request, height_cm=data.get("height_cm", A2_HEIGHTS.start))
                 elif request == "remove" and type(data.get("id")) is int:
                     response = robot.gazebo_barriers("remove", id=data["id"])
                 else:

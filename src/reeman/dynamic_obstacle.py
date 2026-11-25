@@ -19,6 +19,11 @@ PARKED_Z = -1.2
 SPEED = 0.46
 BARRIER_SIZE = (1.20, .24, .21)
 BARRIER_SLOTS = range(1, 7)
+A2_HEIGHTS = range(15, 6, -1)
+A2_SIZES = {slot: (.50, .24, cm / 100) for slot, cm in enumerate(A2_HEIGHTS, BARRIER_SLOTS.stop)}
+# Center-to-center so the near face is 1.23 m ahead of the 0.27 m nose.
+A2_DISTANCE = 1.62
+A2_GOAL_OFFSET = 1.30
 POSE_TOPIC = f"/world/{WORLD}/dynamic_pose/info"
 
 
@@ -42,6 +47,8 @@ def add_obstacle(world, element, box):
     add(MODEL, SIZE, (X, Y_MIN, PARKED_Z), (.65, .22, .80, 1))
     for slot in BARRIER_SLOTS:
         add(barrier_name(slot), BARRIER_SIZE, parked_pose(slot), (.89, .41, .18, 1))
+    for slot, size in A2_SIZES.items():
+        add(barrier_name(slot), size, parked_pose(slot), (.80, .25, .39, 1))
 
 
 def change_frame(pose, source, target):
@@ -115,6 +122,30 @@ class ObstacleServer(socketserver.UnixStreamServer):
         pose.orientation.z, pose.orientation.w = math.sin(yaw / 2), math.cos(yaw / 2)
         self.apply_pose(pose)
 
+    @staticmethod
+    def a2_slot(height):
+        if type(height) is not int or height not in A2_HEIGHTS:
+            raise ValueError("Chiều cao A2 phải là số nguyên từ 7 đến 15 cm")
+        return BARRIER_SLOTS.stop + A2_HEIGHTS.index(height)
+
+    def change_a2(self, old_slot, slot):
+        if old_slot is None:
+            raise ValueError("Cần đặt vật A2 trước khi đổi chiều cao")
+        if old_slot == slot:
+            return
+        x, y, yaw = self.barriers[old_slot]
+        self.place_barrier(old_slot, *parked_pose(old_slot), 0)
+        try:
+            self.place_barrier(slot, x, y, A2_SIZES[slot][2] / 2, yaw)
+        except RuntimeError:
+            try:
+                self.place_barrier(old_slot, x, y, A2_SIZES[old_slot][2] / 2, yaw)
+            except RuntimeError:
+                del self.barriers[old_slot]
+                raise RuntimeError("Gazebo chưa khôi phục được vật A2 sau khi đổi chiều cao")
+            raise
+        self.barriers[slot] = self.barriers.pop(old_slot)
+
     def barriers_command(self, command, request):
         if command == "remove":
             slot = request["id"]
@@ -127,13 +158,21 @@ class ObstacleServer(socketserver.UnixStreamServer):
             return {"obstacles": [], "limit": len(BARRIER_SLOTS)}
         world_robot = self.world_robot()
         map_robot = request["robot"]
-        if command == "add":
-            slot = next((i for i in BARRIER_SLOTS if i not in self.barriers), None)
-            if slot is None:
+        if command in ("add_a2", "change_a2"):
+            slot = self.a2_slot(request.get("height_cm", A2_HEIGHTS.start))
+            active = next((i for i in self.barriers if i in A2_SIZES), None)
+            if command == "change_a2":
+                self.change_a2(active, slot)
+            elif active is not None:
+                raise ValueError("Gỡ vật A2 hiện tại trước khi đặt lại")
+        if command in ("add", "add_a2"):
+            if len(self.barriers) >= len(BARRIER_SLOTS):
                 raise ValueError("Đã đủ 6 vật cản, hãy gỡ một vật cản trước")
+            if command == "add":
+                slot = next(i for i in BARRIER_SLOTS if i not in self.barriers)
             x, y, yaw = change_frame(request["pose"], map_robot, world_robot)
             cosine, sine = math.cos(yaw), math.sin(yaw)
-            length, width, height = BARRIER_SIZE
+            length, width, height = A2_SIZES.get(slot, BARRIER_SIZE)
             half_x = (abs(cosine) * length + abs(sine) * width) / 2
             half_y = (abs(sine) * length + abs(cosine) * width) / 2
             if abs(x) + half_x > 4.94 or abs(y) + half_y > 3.94:
@@ -148,13 +187,20 @@ class ObstacleServer(socketserver.UnixStreamServer):
         obstacles = []
         for slot, pose in sorted(self.barriers.items()):
             x, y, yaw = change_frame(pose, world_robot, map_robot)
-            obstacles.append({"id": slot, "x": x, "y": y, "yaw": yaw,
-                              "length": BARRIER_SIZE[0], "width": BARRIER_SIZE[1]})
+            if slot in A2_SIZES:
+                length, width, height = A2_SIZES[slot]
+                obstacles.append({"id": slot, "x": x, "y": y, "yaw": yaw,
+                                  "length": length, "width": width, "height": height,
+                                  "kind": "a2", "goal": {"x": x + A2_GOAL_OFFSET * math.sin(yaw),
+                                                         "y": y - A2_GOAL_OFFSET * math.cos(yaw)}})
+            else:
+                obstacles.append({"id": slot, "x": x, "y": y, "yaw": yaw,
+                                  "length": BARRIER_SIZE[0], "width": BARRIER_SIZE[1]})
         return {"obstacles": obstacles, "limit": len(BARRIER_SLOTS)}
 
     def command(self, request):
         command = request["command"]
-        if command in ("list", "add", "remove"):
+        if command in ("list", "add", "add_a2", "change_a2", "remove"):
             return self.barriers_command(command, request)
         if command not in ("on", "off", "status"):
             raise ValueError("Lệnh vật cản không hợp lệ")

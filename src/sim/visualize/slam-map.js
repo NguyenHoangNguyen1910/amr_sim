@@ -12,6 +12,7 @@
   let session = "";
   let grid = null;
   let overlay = null;
+  let sensorLayers = {};
   let active = false;
   let generation = 0;
   let driving = null;
@@ -67,25 +68,7 @@
     context.imageSmoothingEnabled = false;
     context.drawImage(tile, left, top, width * scale, height * scale);
 
-    const scan = overlay?.scan;
-    if (scan) {
-      const startX = px(scan.x);
-      const startY = py(scan.y);
-      context.strokeStyle = "rgba(25, 208, 182, .07)";
-      context.fillStyle = "#25b9a6";
-      context.lineWidth = 0.65;
-      context.beginPath();
-      scan.ranges.forEach((distance, beam) => {
-        if (distance == null) return;
-        const angle = scan.yaw + scan.angle_min + beam * scan.angle_step;
-        const x = px(scan.x + distance * Math.cos(angle));
-        const y = py(scan.y + distance * Math.sin(angle));
-        context.moveTo(startX, startY);
-        context.lineTo(x, y);
-        context.fillRect(x - 0.7, y - 0.7, 1.4, 1.4);
-      });
-      context.stroke();
-    }
+    mapSensorLayers.draw(context, sensorLayers, px, py, true);
     const pose = overlay?.pose;
     if (pose) {
       context.save();
@@ -109,13 +92,15 @@
   async function poll(run) {
     if (run !== generation || panel.hidden || drawer.hidden) return;
     try {
-      const result = await api(`/api/slam/map?after=${revision}&previous=${session}`);
+      const query = mapSensorLayers.query();
+      const result = await api(`/api/slam/map?after=${revision}&previous=${session}${query ? "&" + query : ""}`);
       if (run !== generation || drawer.hidden) return;
       if (result.session !== session || result.revision !== revision) {
         grid = result.grid;
         paintGrid();
       }
       overlay = result.overlay ?? null;
+      sensorLayers = result.sensor_layers ?? {lidar: overlay?.scan};
       draw();
       active = result.active;
       revision = result.revision;
@@ -133,6 +118,10 @@
     }
     setTimeout(() => poll(run), 400);
   }
+
+  mapSensorLayers.controls.addEventListener("change", () => {
+    if (!panel.hidden) draw();
+  });
 
   get("map-show-slam").addEventListener("click", () => {
     get("map-show-slam").setAttribute("aria-pressed", "true");
@@ -168,6 +157,7 @@
           revision = -1;
           grid = null;
           overlay = null;
+          sensorLayers = {};
           draw();
         }
         poll(++generation);

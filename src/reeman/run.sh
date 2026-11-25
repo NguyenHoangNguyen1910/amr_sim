@@ -2,7 +2,7 @@
 set -euo pipefail
 
 project="$(cd -- "$(dirname -- "$0")" && pwd)"
-harness="${REEMAN_HARNESS:-/mnt/d/Gazebo/reeman-sim}"
+harness="${REEMAN_HARNESS:-$project/harness}"
 port="${REEMAN_HTTP_PORT:-8010}"
 websocket_port="${REEMAN_GZ_PORT:-9002}"
 device_default=0
@@ -17,10 +17,12 @@ if [[ ! -f "$harness/run.sh" || ! -f "$harness/noetic.sh" ]]; then
 fi
 
 # Stage the tested harness without modifying it or the backup.
-stage="$(mktemp -d /tmp/amr-reeman-launch.XXXXXXXX)"
+compose_dir="${REEMAN_COMPOSE_DIR:-}"
+stage="$(mktemp -d "${compose_dir:-/tmp}/amr-reeman-launch.XXXXXXXX")"
 cp -- "$harness/"*.py "$harness/run.sh" "$harness/noetic.sh" "$stage/"
 cp -- "$project/dashboard.py" "$project/dashboard.html" "$project/room_launch.py" "$stage/"
 cp -- "$project/defined_routes.py" "$project/docking.py" "$project/relocation.py" "$project/obstacle_wait.py" "$stage/"
+cp -- "$project/dynamic_obstacle.py" "$stage/"
 if [[ "$port" == 8020 ]]; then
     cp -- "$project/room_layout.py" "$stage/"
 fi
@@ -29,20 +31,22 @@ if [[ "$device_inputs" == 1 ]]; then
 fi
 if [[ "$openni_input" == 1 ]]; then
     [[ "$device_inputs" == 1 ]] || { echo "REEMAN_OPENNI_INPUT requires REEMAN_DEVICE_INPUTS=1" >&2; exit 2; }
-    backup="${REEMAN_BACKUP:-/mnt/d/Embedded_Backup/ubuntu_root_full}"
-    install="$backup/home/reeman/reeman_ws/install"
-    cp -- "$project/gazebo_depth.cpp" "$project/depth_device.py" "$stage/"
-    if [[ "$port" == 8020 ]]; then
-        cp -- "$project/dynamic_obstacle.py" "$stage/"
+    if [[ -n "$compose_dir" ]]; then
+        ln -s -- "$compose_dir/openni" "$stage/openni"
+    else
+        backup="${REEMAN_BACKUP:-/mnt/d/Embedded_Backup/ubuntu_root_full}"
+        install="$backup/home/reeman/reeman_ws/install"
+        cp -- "$project/gazebo_depth.cpp" "$stage/"
+        mkdir -p "$stage/openni/OpenNI2/Drivers"
+        cp -L -- "$install/lib/libOpenNI2.so" "$stage/openni/"
+        bwrap --ro-bind "$backup/usr" /usr --ro-bind "$backup/etc" /etc \
+            --ro-bind "$install/include/astra_camera/include/openni2" /openni-headers \
+            --symlink usr/bin /bin --symlink usr/lib /lib --symlink usr/lib64 /lib64 \
+            --dev /dev --proc /proc --tmpfs /tmp --bind "$stage" /build --chdir /build \
+            /usr/bin/g++ -std=c++17 -O2 -shared -fPIC -pthread -I/openni-headers \
+            gazebo_depth.cpp -o openni/OpenNI2/Drivers/libGazeboDepth.so
     fi
-    mkdir -p "$stage/openni/OpenNI2/Drivers"
-    cp -L -- "$install/lib/libOpenNI2.so" "$stage/openni/"
-    bwrap --ro-bind "$backup/usr" /usr --ro-bind "$backup/etc" /etc \
-        --ro-bind "$install/include/astra_camera/include/openni2" /openni-headers \
-        --symlink usr/bin /bin --symlink usr/lib /lib --symlink usr/lib64 /lib64 \
-        --dev /dev --proc /proc --tmpfs /tmp --bind "$stage" /build --chdir /build \
-        /usr/bin/g++ -std=c++17 -O2 -shared -fPIC -pthread -I/openni-headers \
-        gazebo_depth.cpp -o openni/OpenNI2/Drivers/libGazeboDepth.so
+    cp -- "$project/depth_device.py" "$stage/"
 fi
 cp -a -- "$project/../sim/visualize" "$stage/viewer"
 if [[ -d "$harness/controls" ]]; then
@@ -69,38 +73,54 @@ if text.count(marker) != 1:
     raise SystemExit("Unrecognized Reeman map staging")
 room_relocate = " --relocate" if sys.argv[5] == "8020" else ""
 room_staging = """if [[ "$world" == room ]]; then
-    mkdir -- "$state/maps"
-    cp -- "$state/room.pgm" "$state/maps/default.pgm"
-    sed 's|^image: .*|image: default.pgm|' "$state/room.yaml" > "$state/maps/default.yaml"
-    printf '0 0 0\\n' > "$state/maps/initPose.txt"
+    if [[ ! -d "$maps" ]]; then
+        mkdir -- "$maps"
+        cp -- "$state/room.pgm" "$maps/default.pgm"
+        sed 's|^image: .*|image: default.pgm|' "$state/room.yaml" > "$maps/default.yaml"
+        printf '0 0 0\\n' > "$maps/initPose.txt"
+    fi
     touch "$state/room-mode"
     /usr/bin/python3 "$sim_dir/room_launch.py" "$backup" "$state/bringup.launch"@ROOM_RELOCATE@
-else
-    """ + marker + """
+elif [[ ! -d "$maps" ]]; then
+    cp -a -- "$backup/home/reeman/data/maps" "$maps"
 fi"""
-text = text.replace(marker, room_staging.replace("@ROOM_RELOCATE@", room_relocate))
+map_setup = 'maps="$state/maps"\n'
+map_staging = room_staging.replace("@ROOM_RELOCATE@", room_relocate)
 if sys.argv[5] == "8020":
-    marker = "fi\ncleanup() {"
-    if text.count(marker) != 1:
-        raise SystemExit("Unrecognized Reeman map storage staging")
-    text = text.replace(marker, """fi
-route_dir="${XDG_DATA_HOME:-$HOME/.local/share}/amr-sim/reeman-8020/$world"
+    map_setup += """route_dir="${XDG_DATA_HOME:-$HOME/.local/share}/amr-sim/reeman-8020/$world"
 if [[ "$world" == map ]]; then
-    map_hash="$(sha256sum "$state/maps/default.pgm")"
+    map_hash="$(sha256sum "$backup/home/reeman/data/maps/default.pgm")"
     route_dir="$route_dir/${map_hash%% *}"
 fi
 mkdir -p -- "$route_dir"
+if [[ -n "$compose_dir" ]]; then
+    ln -s -- "$route_dir" "$compose_dir/routes"
+    maps="$route_dir/maps"
+    if [[ ! -d "$maps" ]]; then
+        map_seed="$(mktemp -d "$route_dir/.map-seed.XXXXXXXX")"
+        maps="$map_seed/maps"
+    fi
+fi
+"""
+    map_staging += """
+if [[ -n "$compose_dir" ]]; then
+    if [[ -n "${map_seed:-}" ]]; then
+        mv -T -- "$maps" "$route_dir/maps"
+        rmdir -- "$map_seed"
+    fi
+    ln -s -- "$route_dir/maps" "$state/maps"
+fi
 for name in model.xml waypoint.yaml; do
     if [[ -f "$state/maps/$name" && ! -f "$route_dir/$name" ]]; then
         cp -n -- "$state/maps/$name" "$route_dir/$name"
     fi
     ln -sfn -- "/sim-routes/$name" "$state/maps/$name"
-done
-cleanup() {""")
-    marker = '--bind "$state/maps" /data/maps'
-    if text.count(marker) != 1:
+done"""
+    mount = '--bind "$state/maps" /data/maps'
+    if text.count(mount) != 1:
         raise SystemExit("Unrecognized Reeman map mount")
-    text = text.replace(marker, '--bind "$route_dir" /sim-routes ' + marker)
+    text = text.replace(mount, '--bind "$route_dir" /sim-routes ' + mount)
+text = text.replace(marker, map_setup + map_staging)
 if device_inputs:
     marker = 'mkdir "$state/ros"'
     if text.count(marker) != 1:
@@ -237,6 +257,11 @@ inner.write_text(text.replace(
 ))
 PY
 
+proxy_host=127.0.0.1
+if [[ -n "$compose_dir" ]]; then
+    ln -s -- "$stage" "$compose_dir/runtime"
+    proxy_host=0.0.0.0
+fi
 runtime_pid=
 proxy_pid=
 cleanup() {
@@ -249,6 +274,6 @@ trap cleanup EXIT
 trap 'exit 130' INT TERM
 bash "$stage/run.sh" "$@" &
 runtime_pid=$!
-/usr/bin/python3 "$project/proxy.py" "$stage/session/dashboard.sock" "$port" &
+/usr/bin/python3 "$project/proxy.py" "$stage/session/dashboard.sock" "$port" "$proxy_host" &
 proxy_pid=$!
 wait -n "$runtime_pid" "$proxy_pid"

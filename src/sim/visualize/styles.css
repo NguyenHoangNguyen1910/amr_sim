@@ -192,6 +192,23 @@ body.map-tools-open #open-map-tools { display: none; }
 }
 .map-tabs button { border-color: transparent; background: transparent; }
 .map-tabs button[aria-pressed="true"] { border-color: #346968; background: #173d40; }
+#map-sensor-layers {
+  display: flex;
+  flex-wrap: wrap;
+  column-gap: 14px;
+  row-gap: 4px;
+  margin: 0 0 10px;
+  padding: 3px 9px 7px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  font-size: 12px;
+}
+#map-sensor-layers legend { padding: 0 4px; color: var(--muted); }
+#map-sensor-layers label { display: inline-flex; align-items: center; gap: 5px; min-height: 24px; cursor: pointer; }
+#map-sensor-layers input { margin: 0; cursor: pointer; }
+#map-sensor-layers input[value="lidar"] { accent-color: #25b9a6; }
+#map-sensor-layers input[value="laser"] { accent-color: #e08218; }
+#map-sensor-layers input[value="camera"] { accent-color: #b645e8; }
 .map-frame { position: relative; }
 #operations-map, #slam-map { display: block; width: 100%; height: auto; border-radius: 9px; background: #182735; }
 #operations-map { cursor: crosshair; }

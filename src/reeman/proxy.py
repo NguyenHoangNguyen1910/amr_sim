@@ -36,6 +36,7 @@ class Server(socketserver.ThreadingTCPServer):
 
 
 if __name__ == "__main__":
-    with Server(("127.0.0.1", int(sys.argv[2])), Relay) as server:
+    bind_address = sys.argv[3] if len(sys.argv) > 3 else "127.0.0.1"
+    with Server((bind_address, int(sys.argv[2])), Relay) as server:
         server.socket_path = sys.argv[1]
         server.serve_forever()
