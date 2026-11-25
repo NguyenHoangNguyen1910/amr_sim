@@ -1,0 +1,219 @@
+<!doctype html>
+<html lang="vi">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Điều hành AMR | Gazebo</title>
+    <script src="https://cdn.jsdelivr.net/npm/protobufjs@6.8.8/dist/protobuf.min.js"></script>
+    <script src="vendor/eventemitter2.min.js"></script>
+    <script src="vendor/gz.js"></script>
+    <script src="vendor/gz3d.js"></script>
+    <link rel="stylesheet" href="styles.css?v=15" />
+  </head>
+  <body>
+    <header id="topbar">
+      <div class="identity">
+        <div class="brand-icon" aria-hidden="true">A</div>
+        <div>
+          <h1>Điều hành AMR</h1>
+          <span id="connection-status" class="status pending">Đang kết nối</span>
+          <span id="sensor-status">Đang chờ cảm biến</span>
+        </div>
+      </div>
+      <div id="navigation-bar" aria-label="Điều hướng">
+        <div class="nav-status">
+          <strong id="navigation-state">Chờ</strong>
+          <span id="navigation-goal">Đích —</span>
+          <span id="navigation-distance">—</span>
+        </div>
+        <div class="button-group">
+          <button id="select-goal-button" type="button">Chọn đích 3D</button>
+          <button id="go-button" class="primary" type="button" disabled>Chạy</button>
+          <button id="stop-navigation-button" type="button" disabled>Dừng</button>
+          <button id="reset-navigation-button" type="button">Đặt lại</button>
+        </div>
+      </div>
+    </header>
+
+    <div class="workspace">
+    <section class="simulation" aria-labelledby="scene-title">
+    <header class="scene-heading">
+      <div>
+        <h2 id="scene-title">Mô phỏng 3D</h2>
+        <span id="pose-status">Đang chờ vị trí robot</span>
+      </div>
+      <div class="button-group">
+        <button id="scene-overview" type="button">Toàn cảnh</button>
+        <button id="wheel-view" type="button" aria-pressed="false" disabled>Bánh xe</button>
+        <button id="open-map-tools" type="button" aria-controls="map-tools" aria-expanded="false">Mở bản đồ 2D</button>
+      </div>
+    </header>
+    <main id="viewer"></main>
+    <aside id="controls" aria-label="Lái thủ công">
+      <div class="control-grid">
+        <span></span>
+        <button type="button" data-linear="1" data-angular="0" aria-label="Tiến">↑</button>
+        <span></span>
+        <button type="button" data-linear="0" data-angular="1.5" aria-label="Quay trái">←</button>
+        <button type="button" data-linear="0" data-angular="0" aria-label="Dừng lái thủ công">■</button>
+        <button type="button" data-linear="0" data-angular="-1.5" aria-label="Quay phải">→</button>
+        <span></span>
+        <button type="button" data-linear="-1" data-angular="0" aria-label="Lùi">↓</button>
+        <span></span>
+      </div>
+      <div class="manual-settings">
+      <strong>Lái thủ công</strong>
+      <div class="speed-control" aria-label="Tốc độ tịnh tiến">
+        <button id="speed-down-button" type="button" aria-label="Giảm tốc độ">−</button>
+        <output id="speed-value" aria-live="polite">0.50 m/s</output>
+        <button id="speed-up-button" type="button" aria-label="Tăng tốc độ">+</button>
+      </div>
+      <div id="turn-speed-control" hidden>
+        <div class="turn-speed-label">
+          <label for="turn-speed">Tốc độ quay</label>
+          <output id="turn-speed-value" for="turn-speed">0,20 rad/s</output>
+        </div>
+        <input id="turn-speed" type="range" min="0.05" max="1.5" step="0.05"
+          value="0.20" aria-describedby="turn-speed-limit" disabled />
+        <small id="turn-speed-limit">Khi quét SLAM, tối đa 0,20 rad/s.</small>
+      </div>
+      <div id="command-status">Tiến 0,00 · Quay 0,00</div>
+      <small>WASD hoặc phím mũi tên · Space để dừng</small>
+      </div>
+    </aside>
+
+    <aside id="sensor-panel" aria-label="Kiểm thử cảm biến">
+      <details>
+        <summary>Cảm biến Reeman</summary>
+        <section>
+          <h2>LiDAR HINS-HE</h2>
+          <canvas id="reeman-scan" width="264" height="132" aria-label="Mặt cắt LiDAR"></canvas>
+          <output id="reeman-scan-status">Đang chờ bản tin</output>
+        </section>
+        <section>
+          <h2>IMU WIT901</h2>
+          <output id="reeman-imu-status">Đang chờ bản tin</output>
+        </section>
+        <section>
+          <h2>Camera depth Astra Max</h2>
+          <canvas id="reeman-depth" width="320" height="160" aria-label="Ảnh độ sâu"></canvas>
+          <output id="reeman-depth-status">Đang chờ ảnh</output>
+          <output id="reeman-camera-scan" hidden></output>
+        </section>
+      </details>
+    </aside>
+    </section>
+    <aside id="map-tools" aria-labelledby="map-title" hidden>
+      <header>
+        <h2 id="map-title">Bản đồ điều hướng</h2>
+        <button id="close-map-tools" type="button">Đóng</button>
+      </header>
+      <div class="map-tabs" aria-label="Chế độ bản đồ">
+        <button id="map-show-layout" type="button" aria-pressed="true">Bản đồ có sẵn</button>
+        <button id="map-show-slam" type="button" aria-pressed="false">Tạo bản đồ mới</button>
+      </div>
+      <section id="mapping-tools" hidden aria-label="Lập bản đồ SLAM">
+        <canvas id="slam-map" width="640" height="520" aria-label="Bản đồ lưới SLAM"></canvas>
+        <p class="slam-legend"><span class="slam-robot-key">● Robot và hướng</span><span class="slam-scan-key">━ Tia LiDAR</span></p>
+        <div class="map-actions">
+          <button id="slam-start" type="button">Bắt đầu bản đồ trắng</button>
+          <button id="slam-stop" type="button" disabled>Dừng quét</button>
+          <button id="slam-save" type="button" disabled>Tải bản đồ JSON</button>
+        </div>
+        <div class="map-actions" aria-label="Giữ nút để lái robot khi lập bản đồ">
+          <button class="slam-drive" data-linear="0.2" type="button">Tiến</button>
+          <button class="slam-drive" data-angular="0.65" type="button">Quay trái</button>
+          <button class="slam-drive" data-angular="-0.65" type="button">Quay phải</button>
+          <button class="slam-drive" data-linear="-0.15" type="button">Lùi</button>
+        </div>
+        <output id="slam-feedback" aria-live="polite"></output>
+      </section>
+      <section id="static-map-tools">
+      <div class="map-frame">
+        <canvas id="operations-map" width="640" height="520" aria-label="Bản đồ điều hướng"></canvas>
+        <div class="map-zoom" aria-label="Tỷ lệ bản đồ">
+          <button id="map-zoom-in" type="button" aria-label="Phóng to bản đồ">+</button>
+          <button id="map-zoom-out" type="button" aria-label="Thu nhỏ bản đồ">−</button>
+          <button id="map-fit" type="button">Vừa khung</button>
+        </div>
+      </div>
+      <ul class="map-legend">
+        <li><i class="key robot-key"></i>Robot</li>
+        <li><i class="key path-key"></i>Đường chạy</li>
+        <li><i class="key waypoint-key"></i>Điểm tuyến</li>
+      </ul>
+      <div class="operation-group">
+        <output id="map-feedback" aria-live="polite"></output>
+        <output id="map-mission-state" aria-live="polite"></output>
+        <div class="map-actions">
+          <button id="map-route-mode" type="button">Chọn waypoint</button>
+          <button id="map-wall-mode" type="button">Vẽ tường ảo</button>
+          <button id="map-undo" type="button">Bỏ điểm cuối</button>
+          <button id="map-save-walls" type="button">Áp dụng tường</button>
+          <button id="map-clear-walls" type="button">Xóa tường trên bản nháp</button>
+          <button id="map-plan-route" type="button">Lập tuyến</button>
+          <button id="map-start-route" class="primary" type="button">Chạy tuyến</button>
+          <button id="map-stop-route" type="button">Dừng</button>
+        </div>
+      </div>
+      <div id="dock-tools" class="operation-group" hidden>
+        <h3>Dock và định vị</h3>
+        <div class="map-actions">
+          <button id="dock-place" type="button">Chọn dock sạc</button>
+          <button id="dock-return" type="button" disabled>Về dock sạc</button>
+          <button id="dock-stop" type="button" hidden>Dừng về sạc</button>
+          <button id="map-relocate" type="button" hidden>Relocate</button>
+          <button id="map-relocate-confirm" type="button" hidden>Áp dụng pose</button>
+          <button id="map-relocate-cancel" type="button" hidden>Hủy đặt pose</button>
+        </div>
+        <output id="dock-status" aria-live="polite"></output>
+      </div>
+      <div id="obstacle-demo-tools" class="operation-group obstacle-tools" hidden>
+        <h3>Vật cản Gazebo</h3>
+        <div class="map-actions">
+          <button id="obstacle-place" type="button" aria-pressed="false" disabled>Đặt vật cản</button>
+          <select id="obstacle-direction" aria-label="Hướng vật cản">
+            <option value="vertical">Dọc ↕</option>
+            <option value="horizontal">Ngang ↔</option>
+          </select>
+          <button id="obstacle-demo-toggle" type="button" aria-pressed="false">Thử vật cản động</button>
+        </div>
+        <div id="placed-obstacle-tools" class="map-actions" hidden>
+          <select id="obstacle-pick" aria-label="Vật cản đã đặt"></select>
+          <button id="obstacle-remove" type="button">Gỡ vật cản</button>
+        </div>
+        <output id="obstacle-placement-status" aria-live="polite"></output>
+        <output id="obstacle-demo-status" aria-live="polite"></output>
+      </div>
+      <form id="obstacle-wait-tools" class="operation-group" hidden>
+        <label for="obstacle-wait-seconds">Thời gian chờ khi gặp vật cản</label>
+        <div class="map-actions">
+          <input id="obstacle-wait-seconds" type="number" min="0" max="20" step="any"
+                 inputmode="decimal" aria-describedby="obstacle-wait-help obstacle-wait-limit" required />
+          <span>giây</span>
+          <button id="obstacle-wait-apply" type="submit" disabled>Áp dụng</button>
+        </div>
+        <small id="obstacle-wait-help">Ngưỡng chờ trước khi Reeman lập lại đường nếu lối vẫn bị chặn.</small>
+        <small id="obstacle-wait-limit" hidden></small>
+        <output id="obstacle-wait-status" aria-live="polite"></output>
+      </form>
+      <fieldset id="defined-route-tools" hidden>
+        <legend>Tuyến có hướng</legend>
+        <div class="map-actions">
+          <button id="graph-add" type="button">Thêm điểm</button>
+          <button id="graph-connect" type="button">Nối có hướng</button>
+          <button id="graph-delete" type="button">Xóa điểm</button>
+          <button id="graph-save" type="button">Lưu tuyến</button>
+        </div>
+        <label>Đích theo tuyến
+          <select id="graph-goal"><option value="">Chọn điểm</option></select>
+        </label>
+      </fieldset>
+      </section>
+    </aside>
+    </div>
+    <script src="app.js?v=15"></script>
+    <script src="map-tools.js?v=11"></script>
+    <script src="slam-map.js?v=5"></script>
+  </body>
+</html>

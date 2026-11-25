@@ -1,0 +1,27 @@
+services:
+  amr:
+    image: amr-app:latest
+    container_name: amr-app
+    build: .
+    init: true
+    environment:
+      GZ_IP: 127.0.0.1
+      GZ_PARTITION: amr_sim
+      GZ_SIM_RESOURCE_PATH: /app/src/sim/models
+      LIBGL_ALWAYS_SOFTWARE: "1"
+      AMR_SLAM_KEY: ${AMR_SLAM_KEY:-amr-compose-local}
+    ports:
+      - "8010:8009"
+      - "9002:9002"
+    command: >-
+      bash -lc '/usr/libexec/gz/sim10/gz-sim-server -v 4 -r --headless-rendering
+      src/sim/worlds/main.sdf &
+      exec uv run python -m server --host 0.0.0.0 --port 8009'
+  slam:
+    profiles: ["slam"]
+    build: ./src/slam
+    depends_on: [amr]
+    environment:
+      AMR_SLAM_API: http://amr:8009/api/slam
+      AMR_SLAM_KEY: ${AMR_SLAM_KEY:-amr-compose-local}
+      ROS_LOCALHOST_ONLY: "1"

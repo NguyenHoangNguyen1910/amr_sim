@@ -1,0 +1,262 @@
+"""State-machine tests for autonomous command ownership."""
+
+from __future__ import annotations
+
+import math
+import threading
+import unittest
+
+from navigation.types import State, Point2D
+from navigation.navigator import NavigationConflict, Navigator
+from navigation.helpers import SensorDataError
+
+
+def scan(sequence: int = 1, front: float | None = None) -> dict:
+    ranges = [None] * 360
+    if front is not None:
+        ranges[0] = front
+    return {
+        "angle_min": 0.0,
+        "angle_max": 6.28,
+        "angle_step": 6.28 / 359,
+        "range_min": 0.12,
+        "range_max": 3.5,
+        "count": 360,
+        "ranges": ranges,
+        "invalid_count": 0,
+        "sequence": sequence,
+    }
+
+
+class FakeTransport:
+    def __init__(self):
+        self.commands = []
+        self.reset_count = 0
+        self.lidar_age = 0.0
+        self.x = 0.0
+        self.y = 0.0
+        self.model_x = -2.0
+        self.model_y = -0.5
+        self.model_yaw = 0.0
+        self.lidar_sequence = 0
+        self.front = None
+
+    def telemetry_snapshot(self):
+        self.lidar_sequence += 1
+        return {
+            "sensors": {
+                "lidar": scan(self.lidar_sequence, self.front),
+                "odometry": {
+                    "position": {"x": self.x, "y": self.y, "z": 0.0},
+                    "yaw": 0.0,
+                    "linear_velocity": {"x": 0.0, "y": 0.0, "z": 0.0},
+                    "angular_velocity": {"x": 0.0, "y": 0.0, "z": 0.0},
+                },
+                "model_pose": {
+                    "position": {
+                        "x": self.model_x,
+                        "y": self.model_y,
+                        "z": 0.01,
+                    },
+                    "yaw": self.model_yaw,
+                },
+            },
+            "freshness": {
+                "lidar": {"received": True, "age_seconds": self.lidar_age},
+                "odometry": {"received": True, "age_seconds": 0.0},
+                "model_pose": {"received": True, "age_seconds": 0.0},
+            },
+        }
+
+    def set_velocity(self, linear, angular):
+        self.commands.append((linear, angular))
+        return {"linear": linear, "angular": angular}
+
+    def reset(self):
+        self.reset_count += 1
+        return True
+
+
+class NavigatorTest(unittest.TestCase):
+    def setUp(self):
+        self.now = [0.0]
+        self.transport = FakeTransport()
+        self.manager = Navigator(
+            self.transport, clock=lambda: self.now[0], auto_start=False
+        )
+
+    def tearDown(self):
+        self.manager.close()
+
+    def test_plan_start_control_and_cancel(self):
+        status = self.manager.plan(Point2D(-2.0, 0.5))
+        self.assertEqual(status["state"], "READY")
+        self.assertEqual(status["start"], {"x": -2.0, "y": -0.5})
+        self.assertTrue(self.manager.owns_control)
+        self.manager.start()
+        self.manager._step()
+        self.assertEqual(self.manager.state, State.NAVIGATING)
+        self.assertNotEqual(self.transport.commands[-1], (0.0, 0.0))
+        self.manager.cancel()
+        self.assertEqual(self.transport.commands[-1], (0.0, 0.0))
+        self.assertFalse(self.manager.owns_control)
+
+    def test_stale_sensor_fails_plan(self):
+        self.transport.lidar_age = 1.0
+        with self.assertRaises(SensorDataError):
+            self.manager.plan(Point2D(-2.0, 0.5))
+        self.assertEqual(self.manager.state, State.ERROR)
+
+    def test_route_advances_without_releasing_control_between_waypoints(self):
+        first, second = Point2D(-2.0, -0.25), Point2D(-2.0, 0.5)
+        self.manager.plan_route((first, second))
+        self.manager.start()
+        self.transport.model_y = first.y
+        self.manager._step()
+        status = self.manager.status()
+        self.assertTrue(status["owns_control"])
+        self.assertEqual(status["goal"], second.to_dict())
+        self.transport.model_y = second.y
+        self.manager._step()
+        self.assertEqual(self.manager.state, State.SUCCEEDED)
+
+    def test_virtual_wall_affects_planner_and_can_be_removed(self):
+        start, end = Point2D(-2.6, 0.0), Point2D(-1.4, 0.0)
+        goal = Point2D(-2.0, 0.5)
+        baseline = self.manager.plan(goal)["path_length_m"]
+        with self.assertRaises(NavigationConflict):
+            self.manager.set_virtual_walls(((start, end),))
+        self.manager.cancel()
+        self.manager.set_virtual_walls(((start, end),))
+        self.assertFalse(self.manager.is_goal_free(Point2D(-2.0, 0.0)))
+        self.assertGreater(self.manager.plan(goal)["path_length_m"], baseline)
+        self.manager.cancel()
+        self.manager.set_virtual_walls(())
+        self.assertTrue(self.manager.is_goal_free(Point2D(-2.0, 0.0)))
+
+    def test_goal_tolerance_stops_and_succeeds(self):
+        self.manager.plan(Point2D(-2.0, -0.47))
+        self.manager.start()
+        self.manager._step()
+        self.assertEqual(self.manager.state, State.SUCCEEDED)
+        self.assertEqual(self.transport.commands[-1], (0.0, 0.0))
+
+    def test_goal_at_current_pose_succeeds_with_zero_command(self):
+        self.manager.plan(Point2D(-2.0, -0.5))
+        self.manager.start()
+        self.manager._step()
+        self.assertEqual(self.manager.state, State.SUCCEEDED)
+        self.assertEqual(self.transport.commands[-1], (0.0, 0.0))
+
+    def test_completed_mission_can_be_followed_by_another_plan(self):
+        self.manager.plan(Point2D(-2.0, -0.5))
+        self.manager.start()
+        self.manager._step()
+        self.assertEqual(self.manager.state, State.SUCCEEDED)
+
+        status = self.manager.plan(Point2D(-2.0, 0.5))
+
+        self.assertEqual(status["state"], State.READY)
+        self.assertEqual(status["goal"], {"x": -2.0, "y": 0.5})
+
+    def test_reset_clears_mission(self):
+        self.manager.plan(Point2D(-2.0, 0.5))
+        self.assertIsNone(self.manager.reset()["error"])
+        self.assertEqual(self.manager.state, State.IDLE)
+        self.assertEqual(self.transport.reset_count, 1)
+        self.assertIsNone(self.manager.status()["goal"])
+
+    def test_speed_is_runtime_configurable(self):
+        self.assertEqual(self.manager.status()["speed_mps"], 0.50)
+        self.assertEqual(self.manager.set_speed_mps(0.90)["speed_mps"], 0.90)
+        self.assertEqual(self.manager.set_speed_mps(0.50)["speed_mps"], 0.50)
+        with self.assertRaises(ValueError):
+            self.manager.set_speed_mps(1.0)
+
+    def test_entering_static_obstacle_transitions_to_blocked(self):
+        self.manager.plan(Point2D(-2.0, 0.5))
+        self.manager.start()
+        self.transport.model_x = 0.0
+        self.transport.model_y = 0.0
+        self.manager._step()
+        self.now[0] = 9.0
+        self.manager._step()
+        self.assertEqual(self.manager.state, State.BLOCKED)
+        self.assertEqual(self.transport.commands[-1], (0.0, 0.0))
+
+    def test_reported_inflated_start_commands_an_escape(self):
+        self.transport.model_x = -1.29
+        self.transport.model_y = -0.03
+        self.transport.model_yaw = math.radians(-4.2)
+        self.transport.front = 0.12
+        self.manager.plan(Point2D(0.56, -1.50))
+        self.manager.start()
+
+        self.manager._step()
+
+        self.assertEqual(self.manager.state, State.NAVIGATING)
+        self.assertLess(self.transport.commands[-1][0], 0.0)
+
+    def test_cancel_discards_in_flight_plan(self):
+        entered = threading.Event()
+        release = threading.Event()
+        original_snapshot = self.transport.telemetry_snapshot
+
+        def blocking_snapshot():
+            entered.set()
+            release.wait(timeout=2.0)
+            return original_snapshot()
+
+        self.transport.telemetry_snapshot = blocking_snapshot
+        errors = []
+        worker = threading.Thread(
+            target=lambda: self._capture_error(
+                errors, lambda: self.manager.plan(Point2D(-2.0, 0.5))
+            )
+        )
+        worker.start()
+        self.assertTrue(entered.wait(timeout=1.0))
+
+        self.manager.cancel()
+        release.set()
+        worker.join(timeout=2.0)
+
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(self.manager.state, State.CANCELLED)
+        self.assertEqual(len(errors), 1)
+
+    def test_cancel_discards_in_flight_control_decision(self):
+        self.manager.plan(Point2D(-2.0, 0.5))
+        self.manager.start()
+        entered = threading.Event()
+        release = threading.Event()
+        original_command = self.manager.local_planner.command
+
+        def blocking_command(**kwargs):
+            entered.set()
+            release.wait(timeout=2.0)
+            return original_command(**kwargs)
+
+        self.manager.local_planner.command = blocking_command
+        worker = threading.Thread(target=self.manager._step)
+        worker.start()
+        self.assertTrue(entered.wait(timeout=1.0))
+
+        self.manager.cancel()
+        release.set()
+        worker.join(timeout=2.0)
+
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(self.manager.state, State.CANCELLED)
+        self.assertEqual(self.transport.commands[-1], (0.0, 0.0))
+
+    @staticmethod
+    def _capture_error(errors, action):
+        try:
+            action()
+        except Exception as error:
+            errors.append(error)
+
+
+if __name__ == "__main__":
+    unittest.main()

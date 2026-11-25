@@ -1,0 +1,188 @@
+<!doctype html>
+<html lang="vi">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Reeman · Gazebo Test</title>
+<style>
+  * { box-sizing: border-box }
+  body { margin: 0; background: #101824; color: #ecf4fb; font: 15px system-ui }
+  header { border-bottom: 1px solid #32465b; padding: 18px max(20px, 4vw) }
+  header strong { font-size: 21px }
+  header span { margin-left: 18px; color: #91aabb }
+  main { max-width: 1200px; margin: auto; padding: 24px; display: grid; grid-template-columns: minmax(0, 2fr) minmax(250px, 1fr); gap: 18px }
+  section { background: #192635; border: 1px solid #32465b; border-radius: 12px; padding: 18px }
+  h1, h2 { font-size: 17px; margin: 0 0 12px }
+  canvas { width: 100%; display: block; background: #111a24; cursor: crosshair }
+  button, input { color: inherit; background: #223c53; border: 1px solid #54718a; border-radius: 6px; font: inherit; padding: 8px 12px }
+  button { cursor: pointer; touch-action: none }
+  button:hover { background: #305471 }
+  button[disabled] { opacity: .45; cursor: default }
+  #send { background: #07756e }
+  #stop { background: #933f48 }
+  .row { display: flex; gap: 8px; flex-wrap: wrap; margin: 12px 0 }
+  dt { color: #a8bfd1; margin-top: 11px }
+  dd { margin: 2px 0 }
+  output { display: block; min-height: 1.5em; color: #a8cae0 }
+  @media (max-width: 720px) { main { grid-template-columns: 1fr } }
+</style>
+<header><strong>Reeman robot18</strong><span>Gazebo · ROS Noetic</span></header>
+<main>
+  <section>
+    <h1>Navi</h1>
+    <canvas id="map" width="720" height="520" aria-label="Bản đồ từ ROS"></canvas>
+    <div class="row">
+      <label>Hướng đích ° <input id="yaw" type="number" value="0" min="-180" max="180" step="1" style="width: 85px"></label>
+      <button id="send" disabled>Đi đến điểm đã chọn</button>
+      <button id="stop">Dừng điều hướng</button>
+    </div>
+    <output id="feedback">Chọn đích trên bản đồ.</output>
+    <output id="navigation"></output>
+  </section>
+  <section>
+    <h2>Lái thủ công</h2>
+    <div class="row">
+      <button data-v="0.18" data-w="0">Tiến</button>
+      <button data-v="-0.12" data-w="0">Lùi</button>
+      <button data-v="0" data-w="0.55">Quay trái</button>
+      <button data-v="0" data-w="-0.55">Quay phải</button>
+    </div>
+    <h2>Cảm biến và định vị ROS</h2>
+    <dl id="sensors"></dl>
+  </section>
+</main>
+<script>
+const get = (id) => document.getElementById(id);
+const canvas = get("map");
+const ctx = canvas.getContext("2d");
+const image = document.createElement("canvas");
+let metadata, pose, goal, view;
+let driveTimer = null, pending = false;
+async function post(path, body) {
+  const response = await fetch("/api/" + path, {
+    method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify(body),
+  });
+  const data = await response.json();
+  if (!response.ok) throw Error(data.error || response.status);
+}
+function point(x, y, color, yaw) {
+  const [minX, minY] = metadata.origin;
+  const px = view.x + (x-minX) / metadata.resolution * view.scale;
+  const py = view.y + (metadata.height-(y-minY) / metadata.resolution) * view.scale;
+  ctx.fillStyle = color;
+  ctx.beginPath();
+  ctx.arc(px, py, 5, 0, 2*Math.PI);
+  ctx.fill();
+  ctx.beginPath();
+  ctx.moveTo(px, py);
+  ctx.lineTo(px + 14*Math.cos(yaw), py - 14*Math.sin(yaw));
+  ctx.strokeStyle = color;
+  ctx.lineWidth = 3;
+  ctx.stroke();
+}
+function draw() {
+  ctx.fillStyle = "#111a24";
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+  if (!metadata) return;
+  const scale = Math.min(canvas.width/metadata.width, canvas.height/metadata.height);
+  view = {scale, x: (canvas.width-metadata.width*scale)/2, y: (canvas.height-metadata.height*scale)/2};
+  ctx.imageSmoothingEnabled = false;
+  ctx.drawImage(image, view.x, view.y, metadata.width*scale, metadata.height*scale);
+  if (pose) point(pose.x, pose.y, "#27f1bf", pose.yaw);
+  if (goal) point(goal.x, goal.y, "#ff9c56", Number(get("yaw").value) * Math.PI / 180);
+}
+async function loadMap(info) {
+  const response = await fetch("/api/map");
+  if (!response.ok) return;
+  const data = new Uint8Array(await response.arrayBuffer());
+  if (data.length !== info.width*info.height) return;
+  image.width = info.width;
+  image.height = info.height;
+  const renderer = image.getContext("2d");
+  const pixels = renderer.createImageData(info.width, info.height);
+  for (let row = 0; row < info.height; row++) {
+    for (let col = 0; col < info.width; col++) {
+      const value = data[row*info.width+col];
+      const i = ((info.height-1-row)*info.width+col)*4;
+      const shade = value ? 240-Math.round((value-1)*2.1) : 88;
+      pixels.data[i] = pixels.data[i+1] = pixels.data[i+2] = shade;
+      pixels.data[i+3] = 255;
+    }
+  }
+  renderer.putImageData(pixels, 0, 0);
+  metadata = info;
+}
+async function update() {
+  try {
+    const response = await fetch("/api/status");
+    const state = await response.json();
+    if (state.map && metadata?.revision !== state.map.revision) await loadMap(state.map);
+    pose = state.pose;
+    get("send").disabled = !goal || !pose;
+    const sensorNodes = [];
+    for (const [name, sample] of Object.entries(state.sensors)) {
+      const label = document.createElement("dt");
+      const value = document.createElement("dd");
+      label.textContent = name;
+      value.textContent = sample.value;
+      sensorNodes.push(label, value);
+    }
+    get("sensors").replaceChildren(...sensorNodes);
+    const latest = state.navigation.at(-1);
+    const labels = {0:"Đang chờ",1:"Đang di chuyển",2:"Đã hủy",3:"Đã đến đích",4:"Không thể đến đích",5:"Đích bị từ chối"};
+    get("navigation").textContent = latest ? (labels[latest.state] || latest.text) : "Đang chờ điều hướng";
+    draw();
+  } catch {
+    get("navigation").textContent = "Đang kết nối ROS Noetic";
+  }
+  setTimeout(update, 450);
+}
+canvas.addEventListener("click", (event) => {
+  if (!metadata) return;
+  const box = canvas.getBoundingClientRect();
+  const col = ((event.clientX-box.left)*canvas.width/box.width-view.x)/view.scale;
+  const row = metadata.height-((event.clientY-box.top)*canvas.height/box.height-view.y)/view.scale;
+  if (col < 0 || row < 0 || col >= metadata.width || row >= metadata.height) return;
+  goal = {x: metadata.origin[0]+col*metadata.resolution, y: metadata.origin[1]+row*metadata.resolution};
+  get("feedback").textContent = `Đích ${goal.x.toFixed(2)} m, ${goal.y.toFixed(2)} m`;
+  get("send").disabled = !pose;
+  draw();
+});
+get("yaw").addEventListener("input", draw);
+get("send").onclick = async () => {
+  try {
+    await post("goal", {...goal, yaw: Number(get("yaw").value)*Math.PI/180});
+    get("feedback").textContent = "Đã gửi đích đến move_base.";
+  } catch (error) { get("feedback").textContent = error.message; }
+};
+get("stop").onclick = () => post("stop", {}).catch(error => { get("feedback").textContent = error.message; });
+const zero = {linear: 0, angular: 0};
+function release() {
+  if (driveTimer === null) return;
+  clearInterval(driveTimer);
+  driveTimer = null;
+  if (!pending) post("drive", zero).catch(() => {});
+}
+for (const button of document.querySelectorAll("[data-v]")) {
+  button.addEventListener("pointerdown", (event) => {
+    if (event.button !== 0 || driveTimer !== null) return;
+    button.setPointerCapture(event.pointerId);
+    const tick = async () => {
+      if (pending) return;
+      pending = true;
+      try {
+        await post("drive", {linear: +button.dataset.v, angular: +button.dataset.w});
+      } catch (error) { get("feedback").textContent = error.message; }
+      finally {
+        pending = false;
+        if (driveTimer === null) post("drive", zero).catch(() => {});
+      }
+    };
+    driveTimer = setInterval(tick, 120);
+    tick();
+  });
+  for (const type of ["pointerup", "pointercancel", "lostpointercapture"]) button.addEventListener(type, release);
+}
+window.addEventListener("blur", release);
+update();
+</script>
+</html>
