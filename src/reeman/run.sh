@@ -11,6 +11,7 @@ device_inputs="${REEMAN_DEVICE_INPUTS:-$device_default}"
 openni_default=0
 if [[ "$device_inputs" == 1 ]]; then openni_default="$device_default"; fi
 openni_input="${REEMAN_OPENNI_INPUT:-$openni_default}"
+direct_devices="${REEMAN_DIRECT_DEVICES:-}"
 if [[ ! -f "$harness/run.sh" || ! -f "$harness/noetic.sh" ]]; then
     echo "Reeman harness not found at $harness" >&2
     exit 1
@@ -53,8 +54,11 @@ if [[ -d "$harness/controls" ]]; then
     cp -a -- "$harness/controls" "$stage/"
 fi
 sed -i 's/\r$//' "$stage/run.sh" "$stage/noetic.sh"
-/usr/bin/python3 - "$stage" "$websocket_port" "$device_inputs" "$openni_input" "$port" <<'PY'
+/usr/bin/python3 - "$stage" "$websocket_port" "$device_inputs" "$openni_input" "$port" "$direct_devices" <<'PY'
 from pathlib import Path
+import os
+import shlex
+import socket
 import sys
 
 root = Path(sys.argv[1])
@@ -67,6 +71,14 @@ text = text.replace(marker, marker + '\nln -s -- "$state" "$sim_dir/session"')
 device_inputs = sys.argv[3] == "1"
 openni_input = sys.argv[4] == "1"
 hardware_cadence = device_inputs and sys.argv[5] == "8020"
+direct_devices = set(sys.argv[6].split(",")) if sys.argv[6] not in ("", "bridge") else set()
+if direct_devices - {"depth", "lidar", "imu"}:
+    raise SystemExit("REEMAN_DIRECT_DEVICES accepts bridge or a list of depth,lidar,imu")
+if direct_devices and (not hardware_cadence or not os.environ.get("REEMAN_COMPOSE_DIR")):
+    raise SystemExit("Direct devices require the 8020 Compose profile")
+if "depth" in direct_devices and not openni_input:
+    raise SystemExit("Direct depth requires REEMAN_OPENNI_INPUT=1")
+
 camera_demo = openni_input and sys.argv[5] == "8020"
 marker = 'cp -a -- "$backup/home/reeman/data/maps" "$state/maps"'
 if text.count(marker) != 1:
@@ -127,8 +139,14 @@ if device_inputs:
         raise SystemExit("Unrecognized Reeman ROS launch staging")
     command = '\n/usr/bin/python3 "$sim_dir/sensor_input_launch.py" "$backup" "$state/bringup.launch"'
     extra = '\ntouch "$state/native-slam-profile"' if hardware_cadence else ""
-    text = text.replace(marker, marker + command + (" --openni" if openni_input else "") +
-                        '\ntouch "$state/device-inputs"' + extra)
+    if openni_input:
+        command += " --openni"
+    if "lidar" in direct_devices:
+        address = socket.gethostbyname(socket.gethostname())
+        command += " --direct-lidar-ip " + shlex.quote(address)
+    if "imu" in direct_devices:
+        command += " --direct-imu"
+    text = text.replace(marker, marker + command + '\ntouch "$state/device-inputs"' + extra)
     bridge = root / "ros_bridge.py"
     bridge_text = bridge.read_text()
     for name, message in (("scan", "LaserScan"), ("imu", "Imu")):
@@ -137,30 +155,47 @@ if device_inputs:
             raise SystemExit(f"Unrecognized {name} bridge publisher")
         topic = "/sim/lidar_raw" if name == "scan" else "/sim/imu_raw"
         bridge_text = bridge_text.replace(original, f'rospy.Publisher("{topic}", {message}')
+    gazebo_bridge = root / "gz_bridge.py"
+    gazebo_text = gazebo_bridge.read_text()
+    replaced_topics = []
+    if "lidar" in direct_devices:
+        replaced_topics.append("/sim/scan")
+    if "imu" in direct_devices:
+        replaced_topics.append("/sim/imu")
     if openni_input:
-        gazebo_bridge = root / "gz_bridge.py"
-        gazebo_text = gazebo_bridge.read_text()
-        # The OpenNI path consumes the simulated depth image only.
-        topics = ("/sim/rgbd/points", "/sim/rgbd/camera_info", "/sim/rgbd/image")
-        routes = tuple(f'("{topic}",' for topic in topics)
-        lines = gazebo_text.splitlines(keepends=True)
-        active_lines = [line for line in lines if not line.lstrip().startswith(routes)]
-        if len(lines) - len(active_lines) != len(routes):
-            raise SystemExit("Unrecognized Gazebo camera routes")
-        gazebo_bridge.write_text("".join(active_lines))
-        bridge_text = bridge_text.replace("import rospy", "import rospy\nfrom depth_device import OpenNIDepthInput")
-        bridge_text = bridge_text.replace("self.connection = connection", "self.connection = connection\n        self.openni_depth = OpenNIDepthInput()")
-        disabled = {"depth", "depth_points", "camera_info", "color"}
-        bridge_text = "".join(
-            line for line in bridge_text.splitlines(keepends=True)
-            if not any(line.lstrip().startswith(f'"{key}":') for key in disabled)
-        )
+        replaced_topics.extend(("/sim/rgbd/points", "/sim/rgbd/camera_info", "/sim/rgbd/image"))
+        if "depth" in direct_devices:
+            replaced_topics.append("/sim/rgbd/depth_image")
+        else:
+            bridge_text = bridge_text.replace("import rospy", "import rospy\nfrom depth_device import OpenNIDepthInput")
+            bridge_text = bridge_text.replace("self.connection = connection", "self.connection = connection\n        self.openni_depth = OpenNIDepthInput()")
         marker = "    def publish(self, message, payload):\n"
         if bridge_text.count(marker) != 1:
             raise SystemExit("Unrecognized depth bridge dispatch")
-        bridge_text = bridge_text.replace(marker, marker +
-            '        if message["kind"] == "depth":\n            self.openni_depth.write(message, payload)\n            return\n'
+        dispatch = "" if "depth" in direct_devices else (
+            '        if message["kind"] == "depth":\n'
+            '            self.openni_depth.write(message, payload)\n            return\n'
+        )
+        bridge_text = bridge_text.replace(marker, marker + dispatch +
             '        if message["kind"] not in self.handlers:\n            return\n')
+    if replaced_topics:
+        routes = tuple(f'("{topic}",' for topic in replaced_topics)
+        lines = gazebo_text.splitlines(keepends=True)
+        active_lines = [line for line in lines if not line.lstrip().startswith(routes)]
+        if len(lines) - len(active_lines) != len(routes):
+            raise SystemExit("Unrecognized Gazebo device routes")
+        gazebo_bridge.write_text("".join(active_lines))
+    disabled = set()
+    if openni_input:
+        disabled.update(("depth", "depth_points", "camera_info", "color"))
+    if "lidar" in direct_devices:
+        disabled.add("scan")
+    if "imu" in direct_devices:
+        disabled.add("imu")
+    bridge_text = "".join(
+        line for line in bridge_text.splitlines(keepends=True)
+        if not any(line.lstrip().startswith(f'"{key}":') for key in disabled)
+    )
     if hardware_cadence:
         marker = "scan_time=0.1,"
         if bridge_text.count(marker) != 1:
@@ -204,6 +239,14 @@ marker = '    plugin(world, "sensors", "Sensors",'
 if text.count(marker) != 1:
     raise SystemExit("Unrecognized Gazebo world generator")
 entry = f'    plugin(world, "websocket-server", "WebsocketServer", (("port", {int(sys.argv[2])}), ("publication_hz", 30)))\n'
+if direct_devices:
+    parameters = {"state_directory": os.environ["REEMAN_COMPOSE_DIR"] + "/state"}
+    parameters.update({name: "true" if name in direct_devices else "false"
+                       for name in ("depth", "lidar", "imu")})
+    entry += f'''    direct = element(world, "plugin", filename="libreeman_direct_devices.so", name="reeman::DirectDevices")
+    for key, value in {parameters!r}.items():
+        element(direct, key, value)
+'''
 text = text.replace(marker, entry + marker)
 if hardware_cadence:
     marker = "(0.05, 50, 0.001), 10, 0.0)"
@@ -248,7 +291,8 @@ marker = "bridge_pid=$!"
 if text.count(marker) != 1:
     raise SystemExit("Unrecognized Reeman Noetic launcher")
 if device_inputs:
-    text = text.replace(marker, marker + '\npython3 /sim/hins_sim.py > /sim-state/hins-device.log 2>&1 &\n'
+    mode = " --direct-relay" if "lidar" in direct_devices else ""
+    text = text.replace(marker, marker + f'\npython3 /sim/hins_sim.py{mode} > /sim-state/hins-device.log 2>&1 &\n'
                         'hins_pid=$!\n')
     marker_cleanup = "cleanup() {"
     text = text.replace(marker_cleanup, marker_cleanup + '\n    if [[ -n "${hins_pid:-}" ]]; then kill -TERM "$hins_pid" 2>/dev/null || true; fi')

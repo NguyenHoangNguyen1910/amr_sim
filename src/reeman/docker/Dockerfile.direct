@@ -1,0 +1,14 @@
+FROM nguyenhoangnguyen/reeman_code:gazebo-8020 AS build
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends g++ libgz-sim10-dev libgz-transport15-dev \
+    && rm -rf /var/lib/apt/lists/*
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends make \
+    && rm -rf /var/lib/apt/lists/*
+COPY src/reeman/native/ /tmp/reeman-native/
+RUN cmake -S /tmp/reeman-native -B /tmp/reeman-build -DCMAKE_BUILD_TYPE=Release \
+    && cmake --build /tmp/reeman-build --parallel 2
+
+FROM nguyenhoangnguyen/reeman_code:gazebo-8020
+COPY --from=build /tmp/reeman-build/libreeman_direct_devices.so /opt/reeman-native/
+ENV GZ_SIM_SYSTEM_PLUGIN_PATH=/opt/reeman-native

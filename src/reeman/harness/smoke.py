@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Verify ROS messages, original processing nodes, TF and closed-loop movement."""
 import math
+from pathlib import Path
 import sys
 import threading
 import time
@@ -30,12 +31,13 @@ def wait_until(check, limit, description):
 
 def main():
     rospy.init_node("reeman_sim_smoke", anonymous=True)
+    imu_frame = "base_link" if Path("/sim-state/device-inputs").exists() else "imu_link"
     topics = {
         "/clock": (Clock, lambda m: m.clock.to_sec() > 0),
         "/scan": (LaserScan, lambda m: m.header.frame_id == "laser_link" and len(m.ranges) > 1000
                   and any(math.isfinite(x) for x in m.ranges)),
         "/scan2": (LaserScan, lambda m: len(m.ranges) > 100),
-        "/imu": (Imu, lambda m: m.header.frame_id == "imu_link"
+        "/imu": (Imu, lambda m: m.header.frame_id == imu_frame
                  and 8 < m.linear_acceleration.z < 12),
         "/mobile/odom": (Odometry, lambda m: m.child_frame_id == "base_footprint"),
         "/odom": (Odometry, lambda m: m.child_frame_id == "base_footprint"),

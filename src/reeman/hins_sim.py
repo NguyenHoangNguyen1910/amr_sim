@@ -2,6 +2,7 @@
 
 import math
 import os
+import select
 import socket
 import struct
 import io
@@ -25,6 +26,8 @@ TOKEN_FIELD_COUNT = 1 + TOKEN_BITS
 TOKEN_WIRE_HIGH = 8192
 TOKEN_DECODE_THRESHOLD = 1000
 MAX_PENDING_SCANS = 32
+TIMING_SOCKET = "/sim-state/hins-timing.sock"
+DIRECT_TIMING = struct.Struct("<QQ")
 
 
 def range_mm(distance):
@@ -64,7 +67,7 @@ def scan_packets(scan, token):
         yield bytes(packet)
 
 
-def main():
+def main(direct=False):
     import rospy
     from sensor_msgs.msg import LaserScan
 
@@ -76,38 +79,69 @@ def main():
     pending_lock = threading.Lock()
     next_token = 0
 
+    def remember_timing(token, timing):
+        with pending_lock:
+            if len(pending) == MAX_PENDING_SCANS:
+                del pending[next(iter(pending))]
+            pending[token] = timing
+
     def send_scan(connection, scan):
         nonlocal next_token
         token = next_token
         next_token = (next_token + 1) & TOKEN_MASK
         packets = b''.join(scan_packets(scan, token))
-        with pending_lock:
-            if len(pending) == MAX_PENDING_SCANS:
-                del pending[next(iter(pending))]
-            pending[token] = (scan.header.stamp, scan.time_increment, scan.scan_time)
+        remember_timing(token, (scan.header.stamp, scan.time_increment, scan.scan_time))
         connection.sendall(packets)
+
+    def publish_decoded(payload):
+        decoded = LaserScan().deserialize(payload)
+        if len(decoded.ranges) != 2 * SECTOR_BEAMS:
+            return
+        token = decode_token(decoded.intensities)
+        if token is None:
+            return
+        with pending_lock:
+            timing = pending.pop(token, None)
+        if timing is None:
+            return
+        decoded.header.stamp, decoded.time_increment, decoded.scan_time = timing
+        decoded.intensities = ((0.0,) * TOKEN_FIELD_COUNT
+                               + tuple(decoded.intensities[TOKEN_FIELD_COUNT:]))
+        scan_output.publish(decoded)
 
     def relay_scans(receiver):
         while not rospy.is_shutdown():
             try:
-                decoded = LaserScan().deserialize(receiver.recv(65536))
+                payload = receiver.recv(65536)
             except socket.timeout:
                 continue
-            if len(decoded.ranges) != 2 * SECTOR_BEAMS:
-                continue
-            # Recover the acquisition time even if consecutive scans have
-            # identical geometry or the driver filters some of their rays.
-            token = decode_token(decoded.intensities)
-            if token is None:
-                continue
-            with pending_lock:
-                timing = pending.pop(token, None)
-            if timing is None:
-                continue
-            decoded.header.stamp, decoded.time_increment, decoded.scan_time = timing
-            decoded.intensities = ((0.0,) * TOKEN_FIELD_COUNT
-                                   + tuple(decoded.intensities[TOKEN_FIELD_COUNT:]))
-            scan_output.publish(decoded)
+            publish_decoded(payload)
+
+    if direct:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as receiver, \
+                socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as timings:
+            receiver.bind(SCAN_SOCKET)
+            timings.bind(TIMING_SOCKET)
+            timings.setblocking(False)
+            try:
+                while not rospy.is_shutdown():
+                    ready, _, _ = select.select([timings, receiver], [], [], 0.5)
+                    if not ready:
+                        continue
+                    # The plugin sends timing before putting data on the TCP stream.
+                    # Drain timing first when both sockets become readable.
+                    while True:
+                        try:
+                            stamp, token = DIRECT_TIMING.unpack(timings.recv(DIRECT_TIMING.size))
+                        except BlockingIOError:
+                            break
+                        seconds, nanos = divmod(stamp, 1_000_000_000)
+                        remember_timing(token, (rospy.Time(seconds, nanos), 0.0, 1.0 / 15))
+                    if receiver in ready:
+                        publish_decoded(receiver.recv(65536))
+            finally:
+                os.unlink(TIMING_SOCKET)
+        return
 
     def reset_pending():
         with pending_lock:
@@ -231,4 +265,4 @@ if __name__ == '__main__':
     elif sys.argv[1:2] == ['--tap']:
         tap_driver_scan()
     else:
-        main()
+        main(direct=sys.argv[1:] == ['--direct-relay'])

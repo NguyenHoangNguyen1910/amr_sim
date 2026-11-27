@@ -1,5 +1,7 @@
 # Chạy mô phỏng Reeman 8020
 
+Nhánh này có bản thử nghiệm cảm biến trực tiếp ở cổng 8021. Xem [cách dựng và chạy bản thử nghiệm](README-lab.md).
+
 Cần Docker và Docker Compose trên máy x86-64. Trên Windows, mở Docker Desktop ở chế độ Linux containers.
 
 ```bash
